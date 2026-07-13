@@ -2,7 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
-import type { HistoryEntry, ModelInfo, Settings, Stats } from "./lib/types";
+import type {
+  AccelStatus,
+  DownloadStage,
+  HistoryEntry,
+  ModelInfo,
+  Settings,
+  Stats,
+} from "./lib/types";
 import Sidebar, { type View } from "./components/Sidebar";
 import HomePage from "./components/HomePage";
 import InsightsPage from "./components/InsightsPage";
@@ -30,6 +37,10 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [stats, setStats] = useState<Stats>(EMPTY_STATS);
 
+  const [accel, setAccel] = useState<AccelStatus>({ gpu: false, llm: false });
+  const [gpuDl, setGpuDl] = useState<{ stage: string; pct: number } | null>(null);
+  const [llmDl, setLlmDl] = useState<{ stage: string; pct: number } | null>(null);
+
   const refreshData = useCallback(() => {
     invoke<HistoryEntry[]>("get_history").then(setHistory);
     invoke<Stats>("get_stats").then(setStats);
@@ -44,13 +55,28 @@ export default function App() {
     setTimeout(() => setStatus(null), 3000);
   }
 
+  // Keep the mic list live: refresh when Settings opens, then poll while it's
+  // open so plugging/unplugging a USB headset shows up without reopening.
+  useEffect(() => {
+    if (!settingsOpen) return;
+    invoke<string[]>("list_mics").then(setMics);
+    const timer = setInterval(
+      () => invoke<string[]>("list_mics").then(setMics),
+      2000,
+    );
+    return () => clearInterval(timer);
+  }, [settingsOpen]);
+
   // Initial load + backend event listeners.
   useEffect(() => {
     invoke<Settings>("get_settings").then(setSettings);
     invoke<string[]>("list_mics").then(setMics);
     refreshModels();
     invoke<boolean>("model_ready").then(setModelReady);
+    invoke<AccelStatus>("accel_status").then(setAccel);
     refreshData();
+
+    const pct = (r: number, t: number) => (t > 0 ? Math.round((r / t) * 100) : 0);
 
     const unsubs = [
       listen<{ id: string; received: number; total: number }>(
@@ -76,6 +102,34 @@ export default function App() {
       }),
       // Fired after every dictation — keeps history/stats live while open.
       listen("dictation-done", refreshData),
+
+      // CUDA Whisper engine download.
+      listen<DownloadStage>("gpu-download-progress", (e) =>
+        setGpuDl({ stage: e.payload.stage, pct: pct(e.payload.received, e.payload.total) }),
+      ),
+      listen("gpu-ready", () => {
+        setGpuDl(null);
+        setAccel((a) => ({ ...a, gpu: true }));
+        flash("GPU engine ready ✓");
+      }),
+      listen<string>("gpu-error", (e) => {
+        setGpuDl(null);
+        flash("GPU error: " + e.payload, false);
+      }),
+
+      // Local AI runtime + model download.
+      listen<DownloadStage>("llm-download-progress", (e) =>
+        setLlmDl({ stage: e.payload.stage, pct: pct(e.payload.received, e.payload.total) }),
+      ),
+      listen("llm-ready", () => {
+        setLlmDl(null);
+        setAccel((a) => ({ ...a, llm: true }));
+        flash("AI model ready ✓");
+      }),
+      listen<string>("llm-error", (e) => {
+        setLlmDl(null);
+        flash("AI error: " + e.payload, false);
+      }),
     ];
 
     // Catch dictations that happened while the window was hidden to tray.
@@ -104,6 +158,16 @@ export default function App() {
     invoke("download_model", { id });
   }
 
+  function onDownloadGpu() {
+    setGpuDl({ stage: "Starting…", pct: 0 });
+    invoke("download_gpu");
+  }
+
+  function onDownloadLlm() {
+    setLlmDl({ stage: "Starting…", pct: 0 });
+    invoke("download_llm");
+  }
+
   if (!settings) {
     return <div className="p-8 text-ink-soft">Loading…</div>;
   }
@@ -123,6 +187,7 @@ export default function App() {
             stats={stats}
             hotkey={settings.hotkey}
             modelReady={modelReady}
+            aiReady={accel.llm}
             onDeleted={refreshData}
             onOpenSettings={() => setSettingsOpen(true)}
           />
@@ -139,6 +204,11 @@ export default function App() {
         models={models}
         downloading={downloading}
         progress={progress}
+        accel={accel}
+        gpuDl={gpuDl}
+        llmDl={llmDl}
+        onDownloadGpu={onDownloadGpu}
+        onDownloadLlm={onDownloadLlm}
         onUpdate={update}
         onDownload={onDownload}
         onHistoryCleared={() => {

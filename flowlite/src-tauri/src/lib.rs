@@ -1,12 +1,17 @@
 mod audio;
+mod gpu;
 mod history;
 mod inject;
+mod llm;
 mod model;
+mod net;
 mod stt;
+mod text;
 
 use audio::Recorder;
 use history::{HistoryEntry, Stats, Store};
 use serde::{Deserialize, Serialize};
+use text::{FillerLevel, Replacement};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use stt::Stt;
@@ -16,7 +21,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, WindowEvent,
 };
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
 
 /// Below this peak amplitude we treat the clip as silence and skip transcription.
 const SILENCE_THRESHOLD: f32 = 0.01;
@@ -27,6 +32,31 @@ pub struct Settings {
     pub model_id: String,
     pub mic: Option<String>,
     pub autostart: bool,
+    /// Hold Ctrl+Win to dictate (push-to-talk), independent of the toggle hotkey.
+    #[serde(default = "default_true")]
+    pub ptt_enabled: bool,
+    /// Custom vocabulary — biases Whisper toward correct spelling of these terms.
+    #[serde(default)]
+    pub dictionary: Vec<String>,
+    /// Post-transcription find/replace rules ("jason" -> "JSON").
+    #[serde(default)]
+    pub replacements: Vec<Replacement>,
+    /// Interpret spoken structural commands ("new line", "scratch that").
+    #[serde(default = "default_true")]
+    pub voice_commands: bool,
+    /// Strip filler words ("um", "uh") at the chosen aggressiveness.
+    #[serde(default)]
+    pub filler_cleanup: FillerLevel,
+    /// Use the CUDA Whisper engine (must be downloaded) instead of CPU.
+    #[serde(default)]
+    pub use_gpu: bool,
+    /// Let spoken commands ("make this formal") trigger a local AI rewrite.
+    #[serde(default = "default_true")]
+    pub ai_voice_commands: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -36,6 +66,13 @@ impl Default for Settings {
             model_id: "small.en".to_string(),
             mic: None,
             autostart: false,
+            ptt_enabled: true,
+            dictionary: Vec::new(),
+            replacements: Vec::new(),
+            voice_commands: true,
+            filler_cleanup: FillerLevel::None,
+            use_gpu: false,
+            ai_voice_commands: true,
         }
     }
 }
@@ -69,8 +106,15 @@ fn persist_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
     std::fs::write(p, json).map_err(|e| e.to_string())
 }
 
-/// Path to the bundled whisper CLI (works in dev and in the installed app).
+/// Path to the whisper CLI. Prefers the downloaded CUDA engine when GPU mode is
+/// on and installed; otherwise the bundled CPU engine (works in dev + installed).
 fn whisper_cli_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let use_gpu = app.state::<AppState>().settings.lock().unwrap().use_gpu;
+    if use_gpu {
+        if let Some(p) = gpu::cli_path(app) {
+            return Ok(p);
+        }
+    }
     app.path()
         .resolve("resources/whisper/whisper-cli.exe", BaseDirectory::Resource)
         .map_err(|e| format!("resolve cli: {e}"))
@@ -112,18 +156,69 @@ fn hide_overlay(app: &AppHandle) {
 
 fn on_hotkey_pressed(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let mut rec = state.recorder.lock().unwrap();
-    if rec.is_recording() {
-        return; // ignore key auto-repeat
-    }
-    match rec.start() {
+    let mic = state.settings.lock().unwrap().mic.clone();
+    let started = {
+        let mut rec = state.recorder.lock().unwrap();
+        if rec.is_recording() {
+            return; // ignore key auto-repeat
+        }
+        rec.start(mic.as_deref())
+    };
+    match started {
         Ok(()) => {
             let _ = app.emit("recording-started", ());
             show_overlay(app);
+            set_cancel_key(app, true);
+            spawn_level_meter(app.clone());
         }
         Err(e) => {
             let _ = app.emit("dictation-error", e);
         }
+    }
+}
+
+/// Register/unregister Escape as a global cancel key while recording.
+fn set_cancel_key(app: &AppHandle, on: bool) {
+    let gs = app.global_shortcut();
+    if on {
+        let _ = gs.register("Escape");
+    } else {
+        let _ = gs.unregister("Escape");
+    }
+}
+
+/// While recording, emit the mic level (~15/s) so the pill can show a live
+/// meter. Exits on its own once recording stops.
+fn spawn_level_meter(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(66));
+        let state = app.state::<AppState>();
+        let rec = state.recorder.lock().unwrap();
+        if !rec.is_recording() {
+            break;
+        }
+        let level = rec.current_level();
+        drop(rec);
+        let _ = app.emit("audio-level", level);
+    });
+}
+
+/// Abort the current recording without transcribing (Esc key).
+fn cancel_recording(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let was_recording = {
+        let mut rec = state.recorder.lock().unwrap();
+        if rec.is_recording() {
+            let _ = rec.stop(); // discard the captured samples
+            true
+        } else {
+            false
+        }
+    };
+    if was_recording {
+        set_cancel_key(app, false);
+        let _ = app.emit("recording-cancelled", ());
+        hide_overlay(app);
     }
 }
 
@@ -152,12 +247,13 @@ fn on_hotkey_released(app: &AppHandle) {
         }
         rec.stop()
     };
+    set_cancel_key(app, false);
     let _ = app.emit("recording-stopped", ());
 
-    // Resolve paths for the transcription thread.
-    let model_id = state.settings.lock().unwrap().model_id.clone();
+    // Snapshot settings for the transcription thread.
+    let cfg = state.settings.lock().unwrap().clone();
     let cli = whisper_cli_path(app);
-    let model = model::model_path(app, &model_id);
+    let model = model::model_path(app, &cfg.model_id);
     let dur_secs = samples.len() as f32 / 16_000.0;
     let app = app.clone();
 
@@ -169,7 +265,22 @@ fn on_hotkey_released(app: &AppHandle) {
             let cli = cli?;
             let model = model?;
             let engine = Stt::new(cli, model);
-            let text = engine.transcribe(&samples)?;
+            let prompt = text::dictionary_prompt(&cfg.dictionary);
+            let raw = engine.transcribe(&samples, prompt.as_deref())?;
+            // Apply voice commands, filler cleanup, and word replacements.
+            let mut text = text::process(
+                &raw,
+                cfg.voice_commands,
+                cfg.filler_cleanup,
+                &cfg.replacements,
+            );
+            // Spoken AI command ("make this formal …") → local rewrite of the rest.
+            if cfg.ai_voice_commands && llm::is_ready(&app) {
+                if let Some((preset, payload)) = llm::detect_command(&text) {
+                    let _ = app.emit("ai-rewriting", ());
+                    text = llm::rewrite(&app, &payload, preset).unwrap_or(payload);
+                }
+            }
             if !text.is_empty() {
                 inject::inject_text(&text)?;
             }
@@ -210,6 +321,70 @@ fn register_hotkey(app: &AppHandle, accelerator: &str) -> Result<(), String> {
     let _ = gs.unregister_all();
     gs.register(accelerator)
         .map_err(|e| format!("register '{accelerator}': {e}"))
+}
+
+/// The registered hotkey is a TOGGLE: first press starts recording, second
+/// press stops and transcribes. Windows fires repeated "Pressed" events while
+/// a key is held (auto-repeat), so we only act on the first press after a
+/// release — otherwise holding the key would instantly stop the recording.
+static TOGGLE_KEY_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn on_toggle_hotkey(app: &AppHandle, state: ShortcutState) {
+    use std::sync::atomic::Ordering;
+    match state {
+        ShortcutState::Pressed => {
+            if TOGGLE_KEY_HELD.swap(true, Ordering::SeqCst) {
+                return; // auto-repeat while held
+            }
+            let recording = app
+                .state::<AppState>()
+                .recorder
+                .lock()
+                .unwrap()
+                .is_recording();
+            if recording {
+                on_hotkey_released(app);
+            } else {
+                on_hotkey_pressed(app);
+            }
+        }
+        ShortcutState::Released => {
+            TOGGLE_KEY_HELD.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Push-to-talk on Ctrl+Win: modifier-only combos can't be registered as
+/// global shortcuts, so a background thread polls the key state (~30 ms).
+/// Both keys down starts recording; releasing either stops and transcribes.
+#[cfg(windows)]
+fn spawn_ptt_listener(app: AppHandle) {
+    std::thread::spawn(move || {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_RWIN,
+        };
+        let key_down = |vk: u16| unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 };
+        let mut was_down = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let enabled = app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .ptt_enabled;
+            let down = enabled
+                && key_down(VK_CONTROL)
+                && (key_down(VK_LWIN) || key_down(VK_RWIN));
+            if down && !was_down {
+                was_down = true;
+                on_hotkey_pressed(&app);
+            } else if !down && was_down {
+                was_down = false;
+                on_hotkey_released(&app);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +447,48 @@ fn list_models(app: AppHandle) -> Vec<ModelInfo> {
 #[tauri::command]
 fn model_ready(app: AppHandle) -> bool {
     model_is_ready(&app)
+}
+
+/// Whether the optional CUDA engine / local AI runtime are installed.
+#[tauri::command]
+fn accel_status(app: AppHandle) -> serde_json::Value {
+    serde_json::json!({
+        "gpu": gpu::is_ready(&app),
+        "llm": llm::is_ready(&app),
+    })
+}
+
+/// Download the CUDA Whisper engine on a background thread.
+#[tauri::command]
+fn download_gpu(app: AppHandle) {
+    std::thread::spawn(move || match gpu::download(&app) {
+        Ok(()) => {
+            let _ = app.emit("gpu-ready", ());
+        }
+        Err(e) => {
+            let _ = app.emit("gpu-error", e);
+        }
+    });
+}
+
+/// Download the local AI runtime + model on a background thread.
+#[tauri::command]
+fn download_llm(app: AppHandle) {
+    std::thread::spawn(move || match llm::download(&app) {
+        Ok(()) => {
+            let _ = app.emit("llm-ready", ());
+        }
+        Err(e) => {
+            let _ = app.emit("llm-error", e);
+        }
+    });
+}
+
+/// Rewrite text with the local model (history panel's AI buttons).
+#[tauri::command]
+fn ai_rewrite(app: AppHandle, text: String, preset: String) -> Result<String, String> {
+    let p = llm::Preset::from_id(&preset).ok_or_else(|| format!("unknown preset: {preset}"))?;
+    llm::rewrite(&app, &text, p)
 }
 
 /// Download a model on a background thread, emitting progress + completion.
@@ -352,9 +569,15 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| match event.state() {
-                    ShortcutState::Pressed => on_hotkey_pressed(app),
-                    ShortcutState::Released => on_hotkey_released(app),
+                .with_handler(|app, shortcut, event| {
+                    // Escape (registered only while recording) cancels.
+                    if *shortcut == Shortcut::new(None, Code::Escape) {
+                        if event.state() == ShortcutState::Pressed {
+                            cancel_recording(app);
+                        }
+                    } else {
+                        on_toggle_hotkey(app, event.state());
+                    }
                 })
                 .build(),
         )
@@ -372,13 +595,16 @@ pub fn run() {
                 store: Mutex::new(Store::load(&handle)),
             });
 
+            #[cfg(windows)]
+            spawn_ptt_listener(handle.clone());
+
             // System tray.
             let show_i = MenuItem::with_id(app, "show", "Settings", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("FlowLite — hold your hotkey to dictate")
+                .tooltip("FlowLite — hold Ctrl+Win or tap your hotkey to dictate")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -430,6 +656,10 @@ pub fn run() {
             clear_history,
             get_stats,
             copy_text,
+            accel_status,
+            download_gpu,
+            download_llm,
+            ai_rewrite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

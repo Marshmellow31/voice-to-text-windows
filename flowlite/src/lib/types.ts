@@ -2,11 +2,38 @@
 // Tauri serializes serde struct fields as-is (only command *arguments* get
 // camelCase mapping).
 
+export type FillerLevel = "none" | "light" | "medium";
+
+export interface Replacement {
+  from: string;
+  to: string;
+}
+
 export interface Settings {
   hotkey: string;
   model_id: string;
   mic: string | null;
   autostart: boolean;
+  ptt_enabled: boolean; // hold Ctrl+Win to dictate
+  dictionary: string[]; // custom vocabulary (biases Whisper)
+  replacements: Replacement[]; // post-transcription find/replace
+  voice_commands: boolean; // "new line", "scratch that", etc.
+  filler_cleanup: FillerLevel; // strip um/uh
+  use_gpu: boolean; // use downloaded CUDA whisper engine
+  ai_voice_commands: boolean; // "make this formal" → AI rewrite
+}
+
+export interface AccelStatus {
+  gpu: boolean; // CUDA whisper engine installed
+  llm: boolean; // local AI runtime + model installed
+}
+
+export type AiPreset = "formal" | "bullets" | "concise" | "grammar";
+
+export interface DownloadStage {
+  stage: string; // human label, e.g. "AI model"
+  received: number;
+  total: number;
 }
 
 export interface ModelInfo {

@@ -1,31 +1,62 @@
 //! Whisper model management: where models live, and one-time download.
 
-use serde::Serialize;
-use std::io::Read;
+use crate::net;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
-/// Available models, cheapest -> most accurate.
-pub const MODELS: &[(&str, &str, &str)] = &[
-    // (id, filename, download url)
+/// Available models, cheapest -> most accurate. Each has one or more download
+/// URLs tried in order: HuggingFace first, then a ModelScope mirror for
+/// networks that can't reach HF's Xet CDN (which is geo-blocked in places).
+/// Note: large-v3-turbo has no ModelScope mirror, so it's HF-only.
+pub const MODELS: &[(&str, &str, &[&str])] = &[
     (
         "tiny.en",
         "ggml-tiny.en-q5_1.bin",
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin",
+        &[
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin",
+            "https://modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-tiny.en-q5_1.bin",
+        ],
     ),
     (
         "base.en",
         "ggml-base.en-q5_1.bin",
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
+        &[
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin",
+            "https://modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-base.en-q5_1.bin",
+        ],
     ),
     (
         "small.en",
         "ggml-small.en-q5_1.bin",
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin",
+        &[
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin",
+            "https://modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-small.en-q5_1.bin",
+        ],
+    ),
+    (
+        "medium.en",
+        "ggml-medium.en-q5_0.bin",
+        &[
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin",
+            "https://modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-medium.en-q5_0.bin",
+        ],
+    ),
+    (
+        "large-v3-turbo",
+        "ggml-large-v3-turbo-q5_0.bin",
+        &["https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"],
+    ),
+    (
+        "large-v3",
+        "ggml-large-v3-q5_0.bin",
+        &[
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+            "https://modelscope.cn/models/cjc1887415157/whisper.cpp/resolve/master/ggml-large-v3-q5_0.bin",
+        ],
     ),
 ];
 
-pub fn model_meta(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+pub fn model_meta(id: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     MODELS.iter().copied().find(|(mid, _, _)| *mid == id)
 }
 
@@ -50,66 +81,11 @@ pub fn is_downloaded(app: &AppHandle, id: &str) -> bool {
     model_path(app, id).map(|p| p.exists()).unwrap_or(false)
 }
 
-#[derive(Clone, Serialize)]
-struct DownloadProgress {
-    id: String,
-    received: u64,
-    total: u64,
-}
-
 /// Download a model, emitting `model-download-progress` events to the UI.
-/// Blocking — call from a background thread.
+/// Uses the shared curl-based downloader (handles HuggingFace Xet URLs, which
+/// an in-process HTTP client mangles). Blocking — call from a background thread.
 pub fn download(app: &AppHandle, id: &str) -> Result<(), String> {
-    let (_, _, url) = model_meta(id).ok_or_else(|| format!("unknown model: {id}"))?;
+    let (_, _, urls) = model_meta(id).ok_or_else(|| format!("unknown model: {id}"))?;
     let dest = model_path(app, id)?;
-    if dest.exists() {
-        return Ok(());
-    }
-
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| format!("download request: {e}"))?;
-    let total: u64 = resp
-        .header("Content-Length")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let tmp = dest.with_extension("part");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create file: {e}"))?;
-    let mut reader = resp.into_reader();
-    let mut buf = [0u8; 64 * 1024];
-    let mut received: u64 = 0;
-    let mut last_emit: u64 = 0;
-
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("write: {e}"))?;
-        received += n as u64;
-        // Throttle events to every ~1 MB.
-        if received - last_emit > 1_000_000 {
-            last_emit = received;
-            let _ = app.emit(
-                "model-download-progress",
-                DownloadProgress {
-                    id: id.to_string(),
-                    received,
-                    total,
-                },
-            );
-        }
-    }
-    drop(file);
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("finalize: {e}"))?;
-    let _ = app.emit(
-        "model-download-progress",
-        DownloadProgress {
-            id: id.to_string(),
-            received,
-            total: received,
-        },
-    );
-    Ok(())
+    net::download_file(app, urls, &dest, "model-download-progress", id)
 }

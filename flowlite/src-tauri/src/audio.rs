@@ -36,14 +36,29 @@ impl Recorder {
         self.stream.is_some()
     }
 
-    /// Begin capturing from the default input device.
-    pub fn start(&mut self) -> Result<(), String> {
+    /// Peak amplitude (0.0–1.0) of the most recent audio, for the live level
+    /// meter in the overlay pill. Cheap — reads only the buffer tail.
+    pub fn current_level(&self) -> f32 {
+        let buf = self.samples.lock().unwrap();
+        let start = buf.len().saturating_sub(3200); // ~last 0.1–0.2 s
+        buf[start..].iter().fold(0.0_f32, |m, &s| m.max(s.abs()))
+    }
+
+    /// Begin capturing. Uses the preferred device by name if it's currently
+    /// connected, otherwise falls back to the system default (so an unplugged
+    /// USB headset never breaks dictation).
+    pub fn start(&mut self, preferred: Option<&str>) -> Result<(), String> {
         if self.stream.is_some() {
             return Ok(()); // already recording — ignore (handles key auto-repeat)
         }
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
+        let device = preferred
+            .and_then(|name| {
+                host.input_devices()
+                    .ok()?
+                    .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+            })
+            .or_else(|| host.default_input_device())
             .ok_or_else(|| "no microphone found".to_string())?;
         let config = device
             .default_input_config()

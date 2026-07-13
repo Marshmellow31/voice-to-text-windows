@@ -24,8 +24,9 @@ impl Stt {
     }
 
     /// Transcribe 16 kHz mono f32 samples. Writes a temp WAV, runs the CLI,
-    /// returns the recognized text.
-    pub fn transcribe(&self, audio_16k_mono: &[f32]) -> Result<String, String> {
+    /// returns the recognized text. `prompt` biases Whisper toward custom
+    /// vocabulary (the user's dictionary terms) when present.
+    pub fn transcribe(&self, audio_16k_mono: &[f32], prompt: Option<&str>) -> Result<String, String> {
         if !self.cli_path.exists() {
             return Err(format!("whisper CLI missing at {:?}", self.cli_path));
         }
@@ -51,6 +52,12 @@ impl Stt {
             .arg(&threads)
             .arg("-nt") // no timestamps — just the text
             .arg("-np"); // no progress prints
+
+        if let Some(p) = prompt {
+            if !p.is_empty() {
+                cmd.arg("--prompt").arg(p);
+            }
+        }
 
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);

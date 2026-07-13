@@ -7,6 +7,7 @@ interface Props {
   stats: Stats;
   hotkey: string;
   modelReady: boolean;
+  aiReady: boolean;
   onDeleted: () => void;
   onOpenSettings: () => void;
 }
@@ -16,6 +17,7 @@ export default function HomePage({
   stats,
   hotkey,
   modelReady,
+  aiReady,
   onDeleted,
   onOpenSettings,
 }: Props) {
@@ -30,7 +32,8 @@ export default function HomePage({
         <div className="relative min-w-0 flex-1 overflow-hidden rounded-2xl bg-teal-deep p-7 text-white">
           <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-teal/40 blur-2xl" />
           <h2 className="font-display text-2xl">
-            Hold down <span className="font-bold">{hotkey}</span> to dictate
+            Hold <span className="font-bold">Ctrl+Win</span> or tap{" "}
+            <span className="font-bold">{hotkey}</span> to dictate
           </h2>
           <p className="mt-2 max-w-md text-sm text-white/80">
             FlowLite works in all your apps. Try it in email, messages, docs or
@@ -65,7 +68,7 @@ export default function HomePage({
         </div>
       </div>
 
-      <HistoryList entries={entries} onDeleted={onDeleted} />
+      <HistoryList entries={entries} onDeleted={onDeleted} aiReady={aiReady} />
     </div>
   );
 }

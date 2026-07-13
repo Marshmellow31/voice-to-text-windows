@@ -1,6 +1,6 @@
 [package]
 name = "flowlite"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local voice-to-text for Windows — hold a hotkey, speak, release"
 authors = ["Harshil Patel"]
 edition = "2021"
@@ -29,10 +29,18 @@ cpal = "0.15"
 hound = "3"                     # write 16-bit PCM WAV for the whisper CLI
 arboard = "3"
 enigo = "0.3"
-# Blocking HTTP for one-time model download
-ureq = "2"
 # Local-time day keys for usage stats (heatmap/streaks)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Post-processing: voice commands, filler cleanup, word replacements
+regex = "1"
+once_cell = "1"
+# Extract downloaded GPU engine / LLM runtime zips
+zip = "2"
+
+[target.'cfg(windows)'.dependencies]
+# Key-state polling for the Ctrl+Win push-to-talk combo (modifier-only combos
+# can't be registered through the global-shortcut plugin)
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 opt-level = 3
