@@ -1,9 +1,11 @@
 mod audio;
+mod history;
 mod inject;
 mod model;
 mod stt;
 
 use audio::Recorder;
+use history::{HistoryEntry, Stats, Store};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -41,6 +43,7 @@ impl Default for Settings {
 pub struct AppState {
     recorder: Mutex<Recorder>,
     settings: Mutex<Settings>,
+    store: Mutex<Store>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -124,6 +127,21 @@ fn on_hotkey_pressed(app: &AppHandle) {
     }
 }
 
+/// Payload for the "dictation-done" event.
+#[derive(Clone, Serialize)]
+struct DictationDone {
+    text: String,
+    words: u32,
+    dur_secs: f32,
+}
+
+/// Whisper emits bracketed tokens like "[BLANK_AUDIO]" on near-silence;
+/// those must not pollute history or stats.
+fn is_noise_token(text: &str) -> bool {
+    (text.starts_with('[') && text.ends_with(']'))
+        || (text.starts_with('(') && text.ends_with(')'))
+}
+
 fn on_hotkey_released(app: &AppHandle) {
     let state = app.state::<AppState>();
     // Stop capture synchronously (same thread that started it).
@@ -140,6 +158,7 @@ fn on_hotkey_released(app: &AppHandle) {
     let model_id = state.settings.lock().unwrap().model_id.clone();
     let cli = whisper_cli_path(app);
     let model = model::model_path(app, &model_id);
+    let dur_secs = samples.len() as f32 / 16_000.0;
     let app = app.clone();
 
     std::thread::spawn(move || {
@@ -159,7 +178,20 @@ fn on_hotkey_released(app: &AppHandle) {
 
         match result {
             Ok(text) => {
-                let _ = app.emit("dictation-done", text);
+                let words = text.split_whitespace().count() as u32;
+                if !text.is_empty() && !is_noise_token(&text) {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let entry = HistoryEntry { ts, text: text.clone(), words, dur_secs };
+                    let state = app.state::<AppState>();
+                    let mut store = state.store.lock().unwrap();
+                    if let Err(e) = store.record(&app, entry) {
+                        eprintln!("history write failed: {e}");
+                    }
+                }
+                let _ = app.emit("dictation-done", DictationDone { text, words, dur_secs });
             }
             Err(e) => {
                 let _ = app.emit("dictation-error", e);
@@ -256,6 +288,43 @@ fn download_model(app: AppHandle, id: String) {
 }
 
 #[tauri::command]
+fn get_history(state: tauri::State<AppState>) -> Vec<HistoryEntry> {
+    // Stored oldest-first; UI wants newest-first.
+    let mut entries = state.store.lock().unwrap().entries.clone();
+    entries.reverse();
+    entries
+}
+
+#[tauri::command]
+fn delete_history_entry(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    ts: u64,
+) -> Result<(), String> {
+    state.store.lock().unwrap().delete(&app, ts)
+}
+
+#[tauri::command]
+fn clear_history(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    state.store.lock().unwrap().clear_entries(&app)
+}
+
+#[tauri::command]
+fn get_stats(state: tauri::State<AppState>) -> Stats {
+    state.store.lock().unwrap().stats.clone()
+}
+
+/// Copy text to the clipboard (used by the history panel's copy button —
+/// arboard is reliable where WebView2's navigator.clipboard is not).
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .map_err(|e| e.to_string())?
+        .set_text(text)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn show_settings_window(app: AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -300,6 +369,7 @@ pub fn run() {
             app.manage(AppState {
                 recorder: Mutex::new(Recorder::new()),
                 settings: Mutex::new(settings),
+                store: Mutex::new(Store::load(&handle)),
             });
 
             // System tray.
@@ -355,6 +425,11 @@ pub fn run() {
             model_ready,
             download_model,
             show_settings_window,
+            get_history,
+            delete_history_entry,
+            clear_history,
+            get_stats,
+            copy_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

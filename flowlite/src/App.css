@@ -1,6 +1,18 @@
 @import "tailwindcss";
 
-/* Transparent root so the overlay window has no background */
+/* FlowLite brand tokens (Wispr-Flow-inspired warm light theme) */
+@theme {
+  --color-cream: #f7f5f2;
+  --color-cream-dark: #eceae5;
+  --color-ink: #232825;
+  --color-ink-soft: #6b7370;
+  --color-teal: #1a6b5f;
+  --color-teal-deep: #0f4a41;
+  --font-display: Georgia, "Times New Roman", serif;
+}
+
+/* Transparent root so the overlay window has no background.
+   The main window paints its own bg on App's wrapper div. */
 html,
 body,
 #root {

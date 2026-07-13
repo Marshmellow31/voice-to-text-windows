@@ -16,7 +16,7 @@ It's inspired by apps like Wispr Flow, with one big difference: **everything run
 4. **Release the key.** The pill switches to "Transcribing…" for about a second.
 5. **Your words appear** in the text field, as if you had typed them.
 
-That's the whole app. It sits quietly in your system tray and works in the background all day.
+That's the whole app. It sits quietly in your system tray and works in the background all day. Every dictation is saved locally so you can revisit, copy, or delete it later, and a built-in Insights page tracks your words-per-minute and daily streak — all computed on your own PC.
 
 ### Offline vs. online — what needs the internet?
 
@@ -44,11 +44,13 @@ Cloud dictation apps put a meter on your words because *their* servers do the wo
   | Tiny | 31 MB | Older/slower PCs, clear speech |
   | Base | 57 MB | Good balance |
   | **Small** ⭐ | 182 MB | Recommended — near cloud-level accuracy |
-- 🖥️ **Settings window** — change the hotkey, pick your microphone, switch models, test dictation.
+- 📜 **Transcription history** — every dictation is saved locally (last 500 kept), grouped by date on the Home screen, with one-click copy and delete.
+- 📊 **Insights page** — average words-per-minute, total words dictated, total dictations, and a GitHub-style activity heatmap with current/longest streaks.
+- 🖥️ **Settings panel** — change the hotkey, pick your microphone, switch models, manage startup and history, all in one modal.
 - 💊 **On-screen pill** — a tiny floating indicator shows when it's listening or transcribing, then disappears.
 - 🧰 **System tray app** — closing the window hides it to the tray; it keeps listening for your hotkey.
 - 🚀 **Start with Windows** — optional toggle; boots silently to the tray.
-- 🤫 **Silence detection** — if you press the key but don't speak, nothing is typed (no garbage output).
+- 🤫 **Silence detection** — if you press the key but don't speak, nothing is typed or recorded (no garbage output, no junk history).
 - 🪶 **Lightweight** — ~10 MB app. It uses Windows' built-in browser engine instead of bundling one, unlike Electron apps that ship 150+ MB.
 - 📋 **Clipboard-safe** — text is inserted via a quick paste, and whatever you had copied before is restored afterwards.
 
@@ -56,11 +58,11 @@ Cloud dictation apps put a meter on your words because *their* servers do the wo
 
 ## Getting Started
 
-1. Run the installer: `FlowLite_0.1.0_x64-setup.exe`
+1. Run the installer: `FlowLite_0.2.0_x64-setup.exe`
    *(Windows SmartScreen may warn about an unknown publisher — click "More info → Run anyway". That warning just means the app isn't code-signed, which costs money and only matters for public distribution.)*
-2. FlowLite opens. In the **Speech Model** section, click **Download** next to "Small (182 MB)".
+2. FlowLite opens on the Home screen. Click the **gear icon** in the sidebar to open Settings, then in **General → Speech model**, click **Download** next to "Small (182 MB)".
 3. Wait for the "Model ready ✓" message (one-time step).
-4. Click into any text field, **hold `F9`**, speak, release. Done.
+4. Click into any text field, **hold `F9`**, speak, release. Your transcript appears both in the app and in the Home screen's history.
 
 > **Tip:** paste into admin-elevated windows (like an Administrator terminal) is blocked by Windows security. Everything else works.
 
@@ -79,16 +81,25 @@ Any dictation app is really four systems glued together. Here's what FlowLite us
 | **3. Turning speech into text** | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — a highly optimized C++ version of OpenAI's open-source Whisper model. FlowLite writes your recording to a temporary WAV file and runs the bundled `whisper-cli.exe` on it in a hidden window. A spoken sentence transcribes in roughly a second on a modern CPU. |
 | **4. Typing the result** | Typing character-by-character is slow and fragile, so FlowLite does what professional dictation tools do: it puts the text on the clipboard, simulates `Ctrl+V`, then restores your original clipboard. Instant, and works in virtually every app. |
 
-Supporting cast: a system-tray icon, the floating overlay pill, a settings window, optional autostart, and single-instance protection (launching it twice just focuses the existing window).
+Supporting cast: a system-tray icon, the floating overlay pill, a settings panel, optional autostart, and single-instance protection (launching it twice just focuses the existing window).
+
+### History & Insights — how they stay lightweight
+
+Both features are read from two small local JSON files instead of a database:
+
+- **`history.json`** — the raw list of dictations (text, timestamp, word count, duration), capped at the last 500. Older entries are trimmed automatically so the file never grows unbounded.
+- **`stats.json`** — lifetime totals (total words, total dictations, total speaking time) plus a per-day word count used for the streak and heatmap. This file is **never cleared** even if you wipe your history, so your all-time stats and streak survive a cleanup.
+
+Both files are written by the **Rust backend** the instant a dictation finishes — not by the UI — so a dictation is recorded even if the settings window is closed and FlowLite is just sitting in the tray. Silence and Whisper's occasional empty-audio hallucinations (like `[BLANK_AUDIO]`) are filtered out before anything is saved, so they don't inflate your word count or streak. Words-per-minute is calculated as total words spoken ÷ total time spent speaking, not total time the app was open.
 
 ### The tech stack, and why
 
 - **[Tauri v2](https://tauri.app)** (desktop shell) — like Electron, but instead of bundling an entire Chrome browser it uses **WebView2**, the browser engine already built into Windows 11. Result: a ~10 MB app instead of 150+ MB, and far less RAM.
-- **React + TypeScript + Tailwind CSS** (the UI) — the settings window and overlay pill are a small web app rendered inside that WebView. Standard web tech, nothing exotic.
-- **Rust** (the backend) — all the real work (hotkeys, audio, running Whisper, pasting) happens in native Rust code, which is fast and memory-safe. The UI and Rust talk over Tauri's built-in message bridge.
+- **React + TypeScript + Tailwind CSS** (the UI) — the settings panel, Home/Insights pages, and overlay pill are a small web app rendered inside that WebView. Icons come from `lucide-react` (a handful of small SVGs, not a full icon-font). Standard web tech, nothing exotic — no router, no animation library, no state-management framework needed at this size.
+- **Rust** (the backend) — all the real work (hotkeys, audio, running Whisper, pasting, history/stats persistence) happens in native Rust code, which is fast and memory-safe. The UI and Rust talk over Tauri's built-in message bridge.
 - **whisper.cpp as a bundled program, not a library** — FlowLite ships the official prebuilt `whisper-cli.exe` (v1.9.1) and runs it as a subprocess.
   *Why not link it as a native library?* We tried (via the `whisper-rs` bindings), and it repeatedly failed to build on a bleeding-edge MSVC/LLVM toolchain. Running the prebuilt CLI is the same engine with zero build fragility — the only cost is the model loading per dictation (~1 s), which is fine for sentence-length clips.
-- **`hound`** writes the WAV file, **`arboard`** handles the clipboard, **`enigo`** simulates the paste keystroke.
+- **`hound`** writes the WAV file, **`arboard`** handles the clipboard (and the history panel's copy button), **`enigo`** simulates the paste keystroke, **`chrono`** stamps each day's word count for the heatmap.
 
 ### Where your data lives
 
@@ -96,6 +107,8 @@ Supporting cast: a system-tray icon, the floating overlay pill, a settings windo
 |---|---|
 | Speech models | `%APPDATA%\com.harshil.flowlite\models\` (downloaded from Hugging Face, one-time) |
 | Settings | `settings.json` in the same folder (hotkey, model choice, mic, autostart) |
+| Transcription history | `history.json` in the same folder (last 500 dictations; "Clear history" in Settings empties this) |
+| Lifetime stats | `stats.json` in the same folder (total words/dictations/speaking time + per-day counts; kept even after clearing history) |
 | Your recordings | **Nowhere** — audio lives in memory, hits a temp WAV file only for the second Whisper needs it, and is deleted |
 
 ### One dictation, under the hood
@@ -110,6 +123,7 @@ release ──► "released" event ──► stream stops ──► pill shows "
               run whisper-cli.exe -m <model> -f <wav> -nt   (hidden window)
               parse text from stdout
               save clipboard ► set text ► send Ctrl+V ► restore clipboard
+              record to history.json + stats.json (skipped if silent/empty)
 pill disappears ──► your words are in the text field  (~1–1.5 s after release)
 ```
 
@@ -128,8 +142,10 @@ npm run tauri build   # production build
 
 Build outputs:
 - `src-tauri/target/release/flowlite.exe` — portable, no install needed
-- `src-tauri/target/release/bundle/nsis/FlowLite_0.1.0_x64-setup.exe` — installer (recommended)
-- `src-tauri/target/release/bundle/msi/FlowLite_0.1.0_x64_en-US.msi` — MSI alternative
+- `src-tauri/target/release/bundle/nsis/FlowLite_0.2.0_x64-setup.exe` — installer (recommended)
+- `src-tauri/target/release/bundle/msi/FlowLite_0.2.0_x64_en-US.msi` — MSI alternative
+
+> Windows locks the exe while FlowLite is running, so quit it from the tray before rebuilding — otherwise `cargo` fails with "Access is denied".
 
 The Whisper engine binaries live in `src-tauri/resources/whisper/` and are bundled automatically by the Tauri build.
 
@@ -139,7 +155,6 @@ The Whisper engine binaries live in `src-tauri/resources/whisper/` and are bundl
 
 - Toggle mode (tap to start / tap to stop) for long dictations
 - Custom dictionary (auto-fix names and jargon Whisper gets wrong)
-- Transcription history panel
 - Optional AI cleanup pass (rewrite the raw transcript as a polished email/message)
 - Multilingual models (current models are English-only)
 - GPU acceleration for near-instant transcription

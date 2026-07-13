@@ -1,6 +1,27 @@
 # FlowLite — Build Status
 
-_Last updated: 2026-07-12_
+_Last updated: 2026-07-13_
+
+## ✅ v0.2.0 SHIPPED — history, insights, Wispr-style UI
+User confirmed v0.1.0 working end-to-end, then v0.2.0 added:
+- **Transcription history** (Rust-owned, `%APPDATA%\com.harshil.flowlite\history.json`,
+  capped 500 entries) + **lifetime stats** (`stats.json`: total words/dictations/speaking
+  secs + per-day word map, survives clear-history). New module `src-tauri/src/history.rs`.
+- New commands: `get_history`, `delete_history_entry(ts)`, `clear_history`, `get_stats`,
+  `copy_text`. `dictation-done` payload is now `{text, words, dur_secs}` (was String).
+- **UI redesign** (Wispr Flow look): cream/teal theme (`@theme` tokens in App.css),
+  icon sidebar (lucide-react), HomePage (hero + stats card + date-grouped history),
+  InsightsPage (WPM/words/dictations cards + GitHub-style heatmap + streaks),
+  SettingsModal (General/System tabs). New `src/components/*` + `src/lib/stats.ts`
+  (unit-tested: 16 assertions pass via node --experimental-strip-types).
+- Main window now 1100×720 resizable. Overlay pill untouched.
+- Outputs: `bundle/nsis/FlowLite_0.2.0_x64-setup.exe`, `bundle/msi/FlowLite_0.2.0_x64_en-US.msi`.
+- Gotcha hit: `cargo` can't overwrite `flowlite.exe` while the app is running (os error 5)
+  — stop the tray instance before `npm run tauri build`.
+
+---
+
+## (v0.1.0 history below)
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for the full plan.
 

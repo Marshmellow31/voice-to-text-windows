@@ -1,6 +1,6 @@
 [package]
 name = "flowlite"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local voice-to-text for Windows — hold a hotkey, speak, release"
 authors = ["Harshil Patel"]
 edition = "2021"
@@ -31,6 +31,8 @@ arboard = "3"
 enigo = "0.3"
 # Blocking HTTP for one-time model download
 ureq = "2"
+# Local-time day keys for usage stats (heatmap/streaks)
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 opt-level = 3
